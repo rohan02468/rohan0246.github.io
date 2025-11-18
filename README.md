@@ -1,1 +1,729 @@
 # rohan0246.github.io
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, collection, query, where, onSnapshot, addDoc, updateDoc, deleteDoc } from 'firebase/firestore';
+import { Home, ClipboardList, Calendar, Users, Settings, Plus, X, Sun, Zap, CheckCircle, AlertTriangle, ChevronDown, ChevronUp } from 'lucide-react';
+
+// --- Global Firebase Variable Initialization ---
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Color mapping for projects
+const PROJECT_COLORS = {
+  'Blue': 'bg-blue-500',
+  'Teal': 'bg-teal-500',
+  'Purple': 'bg-purple-500',
+  'Orange': 'bg-orange-500',
+  'Green': 'bg-green-500',
+};
+
+// Priority mapping
+const PRIORITY_STYLES = {
+  P1: 'bg-red-100 text-red-800 border-red-300', // High Urgency (Accent color from brief)
+  P2: 'bg-yellow-100 text-yellow-800 border-yellow-300', // Medium
+  P3: 'bg-green-100 text-green-800 border-green-300', // Low
+};
+
+// --- Firebase Initialization and Auth Hook ---
+const useFirebase = () => {
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+
+  useEffect(() => {
+    try {
+      const app = initializeApp(firebaseConfig);
+      const firestore = getFirestore(app);
+      const firebaseAuth = getAuth(app);
+      setDb(firestore);
+      setAuth(firebaseAuth);
+
+      const handleAuth = async (user) => {
+        if (user) {
+          setUserId(user.uid);
+          setIsAuthReady(true);
+        } else {
+          try {
+            if (initialAuthToken) {
+              const userCredential = await signInWithCustomToken(firebaseAuth, initialAuthToken);
+              setUserId(userCredential.user.uid);
+            } else {
+              const userCredential = await signInAnonymously(firebaseAuth);
+              setUserId(userCredential.user.uid);
+            }
+          } catch (error) {
+            console.error("Firebase Auth Error:", error);
+          } finally {
+            setIsAuthReady(true);
+          }
+        }
+      };
+
+      const unsubscribe = onAuthStateChanged(firebaseAuth, handleAuth);
+      return () => unsubscribe();
+    } catch (e) {
+      console.error("Firebase setup failed:", e);
+      setIsAuthReady(true);
+    }
+  }, []);
+
+  return { db, auth, userId, isAuthReady };
+};
+
+// --- Custom Hook for Firestore Data ---
+const useTaskFlowData = (db, userId) => {
+  const [projects, setProjects] = useState([]);
+  const [tasks, setTasks] = useState([]);
+  const isReady = !!db && !!userId;
+
+  useEffect(() => {
+    if (!isReady) return;
+
+    const projectPath = `/artifacts/${appId}/users/${userId}/projects`;
+    const taskPath = `/artifacts/${appId}/users/${userId}/tasks`;
+
+    // 1. Listen for Projects
+    const projectsRef = collection(db, projectPath);
+    const unsubscribeProjects = onSnapshot(projectsRef, (snapshot) => {
+      const projectsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setProjects(projectsData);
+    }, (error) => console.error("Error fetching projects:", error));
+
+    // 2. Listen for Tasks
+    const tasksRef = collection(db, taskPath);
+    const unsubscribeTasks = onSnapshot(tasksRef, (snapshot) => {
+      const tasksData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      // Sort tasks: Incomplete first, then by date, then by priority (P1 highest)
+      tasksData.sort((a, b) => {
+        if (a.completed !== b.completed) return a.completed ? 1 : -1;
+        const dateA = a.dueDate ? new Date(a.dueDate).getTime() : Infinity;
+        const dateB = b.dueDate ? new Date(b.dueDate).getTime() : Infinity;
+        if (dateA !== dateB) return dateA - dateB;
+        return (a.priority || 'P3').localeCompare(b.priority || 'P3');
+      });
+      setTasks(tasksData);
+    }, (error) => console.error("Error fetching tasks:", error));
+
+    return () => {
+      unsubscribeProjects();
+      unsubscribeTasks();
+    };
+  }, [db, userId, isReady]);
+
+  return { projects, tasks, isReady };
+};
+
+// --- Utility Functions (CRUD Operations) ---
+
+const createTask = async (db, userId, taskData) => {
+  if (!db || !userId) return console.error("Database not initialized.");
+  try {
+    const taskPath = `/artifacts/${appId}/users/${userId}/tasks`;
+    await addDoc(collection(db, taskPath), {
+      ...taskData,
+      createdAt: new Date().toISOString(),
+      completed: false,
+    });
+  } catch (error) {
+    console.error("Error creating task:", error);
+  }
+};
+
+const updateTask = async (db, userId, taskId, data) => {
+  if (!db || !userId) return console.error("Database not initialized.");
+  try {
+    const taskPath = `/artifacts/${appId}/users/${userId}/tasks/${taskId}`;
+    await updateDoc(doc(db, taskPath), data);
+  } catch (error) {
+    console.error("Error updating task:", error);
+  }
+};
+
+const createProject = async (db, userId, projectData) => {
+  if (!db || !userId) return console.error("Database not initialized.");
+  try {
+    const projectPath = `/artifacts/${appId}/users/${userId}/projects`;
+    await addDoc(collection(db, projectPath), {
+      ...projectData,
+      createdAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("Error creating project:", error);
+  }
+};
+
+const deleteProject = async (db, userId, projectId) => {
+  if (!db || !userId) return console.error("Database not initialized.");
+  try {
+    // 1. Delete all associated tasks first
+    const tasksToDelete = tasks.filter(t => t.projectId === projectId);
+    const taskPath = `/artifacts/${appId}/users/${userId}/tasks`;
+    for (const task of tasksToDelete) {
+      await deleteDoc(doc(db, taskPath, task.id));
+    }
+    // 2. Delete the project
+    const projectPath = `/artifacts/${appId}/users/${userId}/projects/${projectId}`;
+    await deleteDoc(doc(db, projectPath));
+  } catch (error) {
+    console.error("Error deleting project and associated tasks:", error);
+  }
+};
+
+// --- Component: Task Item Renderer ---
+const TaskItem = ({ task, db, userId, projects }) => {
+  const project = projects.find(p => p.id === task.projectId);
+  const projectColorClass = project ? PROJECT_COLORS[project.color] : 'bg-gray-400';
+  const priorityStyle = PRIORITY_STYLES[task.priority] || PRIORITY_STYLES['P3'];
+
+  const toggleComplete = () => {
+    updateTask(db, userId, task.id, { completed: !task.completed });
+  };
+
+  const getDueDateLabel = () => {
+    if (!task.dueDate) return '';
+    const date = new Date(task.dueDate);
+    const now = new Date();
+    now.setHours(0, 0, 0, 0);
+    date.setHours(0, 0, 0, 0);
+
+    const diffTime = date.getTime() - now.getTime();
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+    if (diffDays === 0) return 'Today';
+    if (diffDays === 1) return 'Tomorrow';
+    if (diffDays < 0) return 'Overdue';
+
+    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  };
+
+  return (
+    <div className={`flex items-start p-3 my-2 bg-white rounded-xl shadow-md transition duration-150 ease-in-out ${task.completed ? 'opacity-60 line-through' : 'hover:shadow-lg'}`}>
+      <div 
+        className={`w-6 h-6 rounded-full flex-shrink-0 cursor-pointer flex items-center justify-center transition duration-200 ${projectColorClass}`}
+        onClick={toggleComplete}
+      >
+        {task.completed && <CheckCircle className="text-white w-4 h-4" fill="white" />}
+      </div>
+      
+      <div className="flex-grow ml-4">
+        <p className="font-semibold text-gray-800 text-lg">{task.name}</p>
+        <div className="flex flex-wrap mt-1 text-sm text-gray-500">
+          {project && (
+            <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium mr-2 border border-gray-200`}>
+              <span className={`w-2 h-2 rounded-full mr-1 ${projectColorClass}`}></span>
+              {project.name}
+            </span>
+          )}
+          {task.dueDate && (
+            <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium mr-2 ${getDueDateLabel() === 'Overdue' ? 'bg-red-50 text-red-700' : 'bg-gray-100 text-gray-600'}`}>
+              <Calendar className="w-3 h-3 mr-1" />
+              {getDueDateLabel()}
+            </span>
+          )}
+          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${priorityStyle} border`}>
+            {task.priority || 'P3'}
+          </span>
+        </div>
+      </div>
+
+      <button
+        onClick={() => deleteDoc(doc(db, `/artifacts/${appId}/users/${userId}/tasks`, task.id))}
+        className="ml-4 text-gray-400 hover:text-red-500 transition duration-150"
+        title="Delete Task"
+      >
+        <X className="w-5 h-5" />
+      </button>
+    </div>
+  );
+};
+
+// --- Component: Quick Add Task Modal ---
+const QuickAddTaskModal = ({ isVisible, onClose, db, userId, projects }) => {
+  const [taskName, setTaskName] = useState('');
+  const [dueDate, setDueDate] = useState('');
+  const [priority, setPriority] = useState('P2');
+  const [projectId, setProjectId] = useState('');
+
+  const resetForm = () => {
+    setTaskName('');
+    setDueDate('');
+    setPriority('P2');
+    setProjectId(projects.length > 0 ? projects[0].id : '');
+  };
+
+  useEffect(() => {
+    if (isVisible) {
+      resetForm();
+    }
+  }, [isVisible, projects]);
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (!taskName.trim()) return;
+
+    createTask(db, userId, {
+      name: taskName.trim(),
+      dueDate: dueDate || null,
+      priority: priority,
+      projectId: projectId || null,
+    });
+    
+    onClose();
+    resetForm();
+  };
+
+  if (!isVisible) return null;
+
+  return (
+    <div className="fixed inset-0 bg-gray-900 bg-opacity-70 z-50 flex justify-center items-center p-4" onClick={onClose}>
+      <div 
+        className="bg-white p-6 rounded-xl shadow-2xl w-full max-w-lg animate-fade-in"
+        onClick={e => e.stopPropagation()}
+      >
+        <h2 className="text-2xl font-bold text-teal-600 mb-4 flex justify-between items-center">
+          <Plus className="w-6 h-6 mr-2" /> Quick Add Task
+        </h2>
+        
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700">Task Name</label>
+            <input
+              type="text"
+              value={taskName}
+              onChange={(e) => setTaskName(e.target.value)}
+              placeholder="e.g., Study for MYP exam on Friday 3 pm (Natural Language Simulation)"
+              className="mt-1 block w-full border-gray-300 rounded-lg shadow-sm focus:ring-teal-500 focus:border-teal-500 p-3 text-lg"
+              required
+              autoFocus
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700">Project / Folder</label>
+              <select
+                value={projectId}
+                onChange={(e) => setProjectId(e.target.value)}
+                className="mt-1 block w-full border-gray-300 rounded-lg shadow-sm focus:ring-teal-500 focus:border-teal-500 p-3"
+              >
+                <option value="">No Project</option>
+                {projects.map(p => (
+                  <option key={p.id} value={p.id}>{p.name}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700">Due Date</label>
+              <input
+                type="date"
+                value={dueDate}
+                onChange={(e) => setDueDate(e.target.value)}
+                className="mt-1 block w-full border-gray-300 rounded-lg shadow-sm focus:ring-teal-500 focus:border-teal-500 p-3"
+              />
+            </div>
+          </div>
+          
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Priority</label>
+            <div className="flex space-x-3">
+              {Object.keys(PRIORITY_STYLES).map(p => (
+                <button
+                  key={p}
+                  type="button"
+                  onClick={() => setPriority(p)}
+                  className={`px-4 py-2 rounded-full text-sm font-medium transition duration-150 border-2 ${PRIORITY_STYLES[p]} ${priority === p ? 'ring-2 ring-offset-2 ring-teal-500' : 'opacity-70 hover:opacity-100'}`}
+                >
+                  {p}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <button
+            type="submit"
+            className="w-full bg-teal-600 hover:bg-teal-700 text-white font-bold py-3 rounded-xl transition duration-200 shadow-md hover:shadow-lg mt-6"
+          >
+            Add Task
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+// --- Component: Dashboard View ---
+const TaskDashboard = ({ db, userId, tasks, projects }) => {
+  const today = useMemo(() => new Date().toISOString().slice(0, 10), []);
+
+  const todayTasks = tasks.filter(t => t.dueDate === today && !t.completed);
+  const upcomingTasks = tasks.filter(t => t.dueDate > today && !t.completed);
+  const overdueTasks = tasks.filter(t => t.dueDate < today && !t.completed);
+  const completedTasks = tasks.filter(t => t.completed);
+
+  const getFlowScore = () => {
+    const total = tasks.length;
+    if (total === 0) return { score: 100, color: 'text-gray-500', message: "Ready to flow!" };
+    const completed = completedTasks.length;
+    const overdueCount = overdueTasks.length;
+    
+    if (overdueCount > 0) return { score: 10, color: 'text-red-500', message: "High Overdue Alert! Focus on P1 tasks." };
+    if (todayTasks.length > 5) return { score: 60, color: 'text-orange-500', message: "Busy day ahead. Maintain the flow." };
+    if (completed === total) return { score: 100, color: 'text-green-500', message: "Perfect Flow! Everything is done." };
+    
+    return { score: 85, color: 'text-teal-500', message: "Good Flow. Keep it up!" };
+  };
+
+  const { score, color, message } = getFlowScore();
+
+  const renderTaskList = (list, title, Icon) => (
+    <div className="mt-6">
+      <h3 className="text-xl font-semibold text-gray-800 mb-3 flex items-center">
+        <Icon className="w-5 h-5 mr-2 text-teal-600" />
+        {title} ({list.length})
+      </h3>
+      {list.length === 0 ? (
+        <p className="text-gray-500 p-4 border border-dashed border-gray-300 rounded-xl">No tasks here. Keep your space uncluttered!</p>
+      ) : (
+        list.map(task => (
+          <TaskItem key={task.id} task={task} db={db} userId={userId} projects={projects} />
+        ))
+      )}
+    </div>
+  );
+
+  return (
+    <div className="p-4 sm:p-6 pb-24 max-w-3xl mx-auto">
+      <h1 className="text-3xl font-extrabold text-gray-900 mb-6">Welcome to TaskFlow</h1>
+      
+      {/* Flow Score Card */}
+      <div className="bg-white p-5 rounded-2xl shadow-xl flex justify-between items-center mb-6 border-l-4 border-teal-500">
+        <div>
+          <p className="text-sm font-medium text-gray-500">Your Current Flow Score</p>
+          <p className={`text-4xl font-bold ${color}`}>{score}%</p>
+        </div>
+        <p className={`text-sm font-medium max-w-xs text-right`}>{message}</p>
+        <Zap className={`w-10 h-10 ${color}`} />
+      </div>
+
+      {renderTaskList(overdueTasks, '🚨 Overdue Tasks', AlertTriangle)}
+      {renderTaskList(todayTasks, '☀️ Today\'s Focus', Sun)}
+      {renderTaskList(upcomingTasks, '🗓️ Upcoming Tasks', Calendar)}
+      {renderTaskList(completedTasks, '✅ Completed', CheckCircle)}
+    </div>
+  );
+};
+
+// --- Component: Projects View ---
+const ProjectView = ({ db, userId, tasks, projects }) => {
+  const [newProjectName, setNewProjectName] = useState('');
+  const [newProjectColor, setNewProjectColor] = useState('Teal');
+  const [isAddingProject, setIsAddingProject] = useState(false);
+  const [expandedProjectId, setExpandedProjectId] = useState(null);
+
+  const handleCreateProject = (e) => {
+    e.preventDefault();
+    if (!newProjectName.trim()) return;
+    createProject(db, userId, { name: newProjectName.trim(), color: newProjectColor });
+    setNewProjectName('');
+    setIsAddingProject(false);
+  };
+
+  const toggleExpand = (projectId) => {
+    setExpandedProjectId(expandedProjectId === projectId ? null : projectId);
+  };
+
+  return (
+    <div className="p-4 sm:p-6 pb-24 max-w-3xl mx-auto">
+      <h1 className="text-3xl font-extrabold text-gray-900 mb-6">Projects & Folders</h1>
+      
+      <button 
+        onClick={() => setIsAddingProject(!isAddingProject)}
+        className="w-full flex items-center justify-center p-3 mb-4 rounded-xl text-white bg-teal-600 hover:bg-teal-700 transition duration-150 font-medium shadow-md"
+      >
+        <Plus className="w-5 h-5 mr-2" /> {isAddingProject ? 'Cancel' : 'New Project'}
+      </button>
+
+      {isAddingProject && (
+        <form onSubmit={handleCreateProject} className="bg-white p-4 rounded-xl shadow-lg mb-6 space-y-3 animate-slide-down">
+          <input
+            type="text"
+            value={newProjectName}
+            onChange={(e) => setNewProjectName(e.target.value)}
+            placeholder="Project Name (e.g., Q3 Client Report)"
+            className="w-full border-gray-300 rounded-lg p-2 focus:ring-teal-500 focus:border-teal-500"
+            required
+          />
+          <div className="flex space-x-2 justify-center">
+            {Object.entries(PROJECT_COLORS).map(([colorName, colorClass]) => (
+              <div 
+                key={colorName}
+                onClick={() => setNewProjectColor(colorName)}
+                className={`w-8 h-8 rounded-full cursor-pointer transition duration-150 ${colorClass} ${newProjectColor === colorName ? 'ring-4 ring-offset-2 ring-teal-500' : ''}`}
+                title={colorName}
+              ></div>
+            ))}
+          </div>
+          <button
+            type="submit"
+            className="w-full bg-teal-500 hover:bg-teal-600 text-white font-medium py-2 rounded-lg"
+          >
+            Create
+          </button>
+        </form>
+      )}
+
+      {projects.length === 0 ? (
+        <p className="text-gray-500 p-6 border border-dashed border-gray-300 rounded-xl">No projects created yet. Start organizing!</p>
+      ) : (
+        <div className="space-y-3">
+          {projects.map(project => {
+            const projectTasks = tasks.filter(t => t.projectId === project.id);
+            const incompleteCount = projectTasks.filter(t => !t.completed).length;
+            const projectColorClass = PROJECT_COLORS[project.color];
+
+            return (
+              <div key={project.id} className="bg-white rounded-xl shadow-md overflow-hidden transition duration-150">
+                <div 
+                  className="flex items-center p-4 cursor-pointer hover:bg-gray-50 transition duration-150"
+                  onClick={() => toggleExpand(project.id)}
+                >
+                  <div className={`w-3 h-3 rounded-full mr-3 flex-shrink-0 ${projectColorClass}`}></div>
+                  <div className="flex-grow">
+                    <h2 className="text-lg font-semibold text-gray-800">{project.name}</h2>
+                    <p className="text-sm text-gray-500">{incompleteCount} task{incompleteCount !== 1 ? 's' : ''} remaining</p>
+                  </div>
+                  <button 
+                    onClick={(e) => { e.stopPropagation(); deleteProject(db, userId, project.id); }}
+                    className="text-gray-400 hover:text-red-500 mr-4"
+                    title="Delete Project"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                  {expandedProjectId === project.id ? <ChevronUp className="w-5 h-5 text-gray-500" /> : <ChevronDown className="w-5 h-5 text-gray-500" />}
+                </div>
+
+                {expandedProjectId === project.id && (
+                  <div className="p-4 pt-0 border-t border-gray-100">
+                    <div className="space-y-2">
+                      {projectTasks.length === 0 ? (
+                        <p className="text-gray-500 text-sm italic py-2">No tasks in this project yet.</p>
+                      ) : (
+                        projectTasks.map(task => (
+                          <TaskItem 
+                            key={task.id} 
+                            task={task} 
+                            db={db} 
+                            userId={userId} 
+                            projects={projects}
+                          />
+                        ))
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// --- Component: Shared/Collaboration View (Freemium Model Demo) ---
+const CollaborationView = ({ userId }) => {
+  return (
+    <div className="p-4 sm:p-6 pb-24 max-w-3xl mx-auto">
+      <h1 className="text-3xl font-extrabold text-gray-900 mb-6">Team & Collaboration</h1>
+      
+      <div className="bg-white p-6 rounded-2xl shadow-xl border-l-4 border-orange-400">
+        <div className="flex items-center mb-4">
+          <Zap className="w-8 h-8 text-orange-500 mr-3" />
+          <h2 className="text-xl font-bold text-orange-600">TaskFlow Pro Feature</h2>
+        </div>
+        
+        <p className="text-gray-700 mb-4">
+          This is where you would access your **Shared Family Calendars**, **Team Projects**, and **real-time communication** features. 
+          Your research indicated this feature is crucial for parents and professionals.
+        </p>
+        <p className="text-gray-600 mb-6 font-medium">
+          As part of the **Freemium Model**, collaboration is a premium feature to unlock advanced team functionality and platform sync.
+        </p>
+        
+        <div className="bg-orange-50 p-4 rounded-lg">
+           <p className="text-sm text-orange-700">
+              User ID for Collaboration (Share this ID with a friend to simulate collaboration):
+           </p>
+           <code className="block bg-orange-100 p-2 mt-2 rounded font-mono text-xs overflow-x-auto break-all">{userId}</code>
+        </div>
+
+        <button 
+          className="w-full mt-4 bg-orange-500 hover:bg-orange-600 text-white font-bold py-3 rounded-xl transition duration-200"
+        >
+          Upgrade to TaskFlow Pro (Simulated)
+        </button>
+      </div>
+      
+      {/* Simulation Content */}
+      <div className="mt-8">
+        <h3 className="text-xl font-semibold text-gray-800 mb-3">Simulated Shared Projects</h3>
+        <div className="bg-white p-4 rounded-xl shadow-md border-l-4 border-green-500 mb-2">
+            <p className="font-medium">Family Grocery List</p>
+            <p className="text-sm text-gray-500">Shared with: Jane, Joe</p>
+        </div>
+        <div className="bg-white p-4 rounded-xl shadow-md border-l-4 border-blue-500">
+            <p className="font-medium">Work - Q4 Marketing Plan</p>
+            <p className="text-sm text-gray-500">Shared with: Alex, Sarah</p>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// --- Component: Bottom Navigation ---
+const BottomNav = ({ currentView, setView, showQuickAdd }) => {
+  const navItems = [
+    { name: 'Dashboard', icon: Home, view: 'dashboard' },
+    { name: 'Projects', icon: ClipboardList, view: 'projects' },
+    { name: 'Calendar', icon: Calendar, view: 'calendar' },
+    { name: 'Shared', icon: Users, view: 'shared' },
+    { name: 'Settings', icon: Settings, view: 'settings' },
+  ];
+
+  return (
+    <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-2xl z-40">
+      <div className="max-w-4xl mx-auto flex justify-around h-16 relative">
+        {/* Floating Quick Add Button */}
+        <button
+          onClick={showQuickAdd}
+          className="absolute -top-6 left-1/2 transform -translate-x-1/2 w-14 h-14 bg-teal-600 text-white rounded-full flex items-center justify-center shadow-2xl hover:bg-teal-700 transition duration-300 ring-4 ring-white"
+          title="Quick Add Task"
+        >
+          <Plus className="w-7 h-7" />
+        </button>
+
+        {navItems.map((item) => (
+          <button
+            key={item.view}
+            onClick={() => setView(item.view)}
+            className={`flex flex-col items-center justify-center p-2 text-sm font-medium transition duration-200 ${currentView === item.view ? 'text-teal-600' : 'text-gray-500 hover:text-teal-500'} ${item.view === 'calendar' ? 'mr-12' : ''}`}
+          >
+            <item.icon className="w-5 h-5 mb-1" />
+            <span className="hidden sm:inline">{item.name}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+
+// --- Main Application Component ---
+const App = () => {
+  const { db, userId, isAuthReady } = useFirebase();
+  const { projects, tasks, isReady: isDataReady } = useTaskFlowData(db, userId);
+  const [currentView, setCurrentView] = useState('dashboard');
+  const [isModalOpen, setIsModalOpen] = useState(false);
+
+  // CSS for slide-down animation
+  const animationStyles = `
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+    @keyframes slideDown {
+      from { opacity: 0; transform: translateY(-20px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .animate-fade-in {
+      animation: fadeIn 0.3s ease-out;
+    }
+    .animate-slide-down {
+      animation: slideDown 0.3s ease-out;
+    }
+  `;
+
+  if (!isAuthReady || !isDataReady) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-gray-50">
+        <p className="text-xl text-teal-600 font-medium">TaskFlow initializing...</p>
+      </div>
+    );
+  }
+
+  // Determine which main view to render
+  let ViewComponent;
+  switch (currentView) {
+    case 'projects':
+      ViewComponent = <ProjectView db={db} userId={userId} tasks={tasks} projects={projects} />;
+      break;
+    case 'shared':
+      ViewComponent = <CollaborationView userId={userId} />;
+      break;
+    case 'settings':
+    case 'calendar':
+      ViewComponent = (
+        <div className="p-4 sm:p-6 pb-24 max-w-3xl mx-auto">
+          <h1 className="text-3xl font-extrabold text-gray-900 mb-6">{currentView === 'calendar' ? 'Visual Calendar View' : 'Settings'}</h1>
+          <div className="bg-white p-6 rounded-xl shadow-md min-h-64 flex items-center justify-center text-gray-500">
+            <p>
+              {currentView === 'calendar' 
+                ? "Calendar visualization is part of the interactive prototype. It would show your tasks arranged weekly/monthly."
+                : `User ID: ${userId}. This section is for account and app preference management.`
+              }
+            </p>
+          </div>
+        </div>
+      );
+      break;
+    case 'dashboard':
+    default:
+      ViewComponent = <TaskDashboard db={db} userId={userId} tasks={tasks} projects={projects} />;
+      break;
+  }
+
+  return (
+    <>
+      <style>{animationStyles}</style>
+      <div className="min-h-screen bg-gray-50 font-sans">
+        {/* Header */}
+        <header className="sticky top-0 bg-white shadow-sm z-30">
+          <div className="max-w-4xl mx-auto p-4 flex justify-between items-center">
+            <h1 className="text-2xl font-black text-teal-600">TaskFlow</h1>
+            <div className="text-sm text-gray-600 flex items-center">
+               <span className="w-8 h-8 rounded-full bg-teal-100 text-teal-600 flex items-center justify-center font-bold">
+                 {userId.slice(0, 2).toUpperCase()}
+               </span>
+            </div>
+          </div>
+        </header>
+
+        {/* Main Content View */}
+        <main className="pb-20">
+          {ViewComponent}
+        </main>
+
+        {/* Quick Add Modal */}
+        <QuickAddTaskModal
+          isVisible={isModalOpen}
+          onClose={() => setIsModalOpen(false)}
+          db={db}
+          userId={userId}
+          projects={projects}
+        />
+
+        {/* Bottom Navigation */}
+        <BottomNav
+          currentView={currentView}
+          setView={setCurrentView}
+          showQuickAdd={() => setIsModalOpen(true)}
+        />
+      </div>
+    </>
+  );
+};
+
+export default App;
